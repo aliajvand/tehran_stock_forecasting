@@ -1,0 +1,160 @@
+"""
+فیچرهای تکنیکال (بدون وابستگی به TA-Lib؛ همه با pandas پیاده شده‌اند).
+
+شامل: SMA، EMA، RSI، MACD، Bollinger Bands، ATR، Stochastic و بازدهی‌ها.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Iterable, List, Optional
+
+import numpy as np
+import pandas as pd
+from loguru import logger
+
+from src.config import get_section
+
+
+def sma(series: pd.Series, window: int) -> pd.Series:
+    """میانگین متحرک ساده."""
+    return series.rolling(window=window, min_periods=max(2, window // 2)).mean()
+
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    """میانگین متحرک نمایی."""
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """شاخص قدرت نسبی (RSI) با روش میانگین نمایی Wilder."""
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    values = 100 - 100 / (1 + rs)
+    # روند صعودی خالص (زیان صفر) = ۱۰۰ | بازار بی‌حرکت = ۵۰
+    values = values.mask((loss == 0) & (gain > 0), 100.0)
+    values = values.mask((loss == 0) & (gain == 0), 50.0)
+    return values.fillna(50.0)
+
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    """MACD، خط سیگنال و هیستوگرام."""
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    return pd.DataFrame(
+        {"macd": macd_line, "macd_signal": signal_line, "macd_hist": macd_line - signal_line}
+    )
+
+
+def bollinger(series: pd.Series, window: int = 20, num_std: float = 2.0) -> pd.DataFrame:
+    """باندهای بولینگر + پهنای باند + موقعیت نسبی قیمت داخل باند."""
+    mid = sma(series, window)
+    std = series.rolling(window=window, min_periods=max(2, window // 2)).std(ddof=0)
+    upper, lower = mid + num_std * std, mid - num_std * std
+    width = (upper - lower) / mid.replace(0, np.nan)
+    pct = (series - lower) / (upper - lower).replace(0, np.nan)
+    return pd.DataFrame(
+        {"bb_mid": mid, "bb_upper": upper, "bb_lower": lower, "bb_width": width, "bb_pct": pct}
+    )
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """میانگین دامنه واقعی (ATR)."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def stochastic(
+    high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 14, d_period: int = 3
+) -> pd.DataFrame:
+    """اسیلاتور استوکاستیک (%K و %D)."""
+    lowest = low.rolling(k_period, min_periods=max(2, k_period // 2)).min()
+    highest = high.rolling(k_period, min_periods=max(2, k_period // 2)).max()
+    k = 100 * (close - lowest) / (highest - lowest).replace(0, np.nan)
+    return pd.DataFrame({"stoch_k": k, "stoch_d": k.rolling(d_period, min_periods=1).mean()})
+
+
+def _compute_one(df: pd.DataFrame, params: Dict) -> pd.DataFrame:
+    """محاسبه همه فیچرهای تکنیکال برای یک نماد (df مرتب‌شده بر اساس تاریخ)."""
+    out = df.copy()
+    close = pd.to_numeric(out["close"], errors="coerce")
+    high = pd.to_numeric(out.get("high", close), errors="coerce")
+    low = pd.to_numeric(out.get("low", close), errors="coerce")
+    volume = pd.to_numeric(out.get("volume", pd.Series(0, index=out.index)), errors="coerce")
+
+    for window in params.get("sma", [5, 10, 20, 50]):
+        out[f"sma_{window}"] = sma(close, int(window))
+        out[f"close_to_sma_{window}"] = close / out[f"sma_{window}"].replace(0, np.nan) - 1
+    for span in params.get("ema", [12, 26]):
+        out[f"ema_{span}"] = ema(close, int(span))
+
+    out["rsi"] = rsi(close, int(params.get("rsi", 14)))
+    macd_cfg = params.get("macd", {}) or {}
+    out = out.join(
+        macd(
+            close,
+            int(macd_cfg.get("fast", 12)),
+            int(macd_cfg.get("slow", 26)),
+            int(macd_cfg.get("signal", 9)),
+        )
+    )
+    bb_cfg = params.get("bollinger", {}) or {}
+    out = out.join(bollinger(close, int(bb_cfg.get("window", 20)), float(bb_cfg.get("std", 2.0))))
+    out["atr"] = atr(high, low, close, int(params.get("atr", 14)))
+    out["atr_pct"] = out["atr"] / close.replace(0, np.nan)
+    st_cfg = params.get("stochastic", {}) or {}
+    out = out.join(stochastic(high, low, close, int(st_cfg.get("k", 14)), int(st_cfg.get("d", 3))))
+
+    # بازدهی و نوسان (تبدیل inf به NaN تا در مراحل بعدی بی‌ضرر شود)
+    out["return_1d"] = close.pct_change().replace([np.inf, -np.inf], np.nan)
+    out["return_5d"] = close.pct_change(5).replace([np.inf, -np.inf], np.nan)
+    out["return_20d"] = close.pct_change(20).replace([np.inf, -np.inf], np.nan)
+    out["volatility_20d"] = out["return_1d"].rolling(20, min_periods=5).std(ddof=0)
+    out["volume_ratio_20d"] = volume / volume.rolling(20, min_periods=5).mean().replace(0, np.nan)
+    out["hl_range_pct"] = (high - low) / close.replace(0, np.nan)
+    return out
+
+
+def compute_all_technical(
+    df: pd.DataFrame, params: Optional[Dict] = None, dropna: bool = False
+) -> pd.DataFrame:
+    """
+    محاسبه همه فیچرهای تکنیکال.
+
+    اگر ستون ``symbol`` وجود داشته باشد، محاسبه به‌صورت گروهی (هر نماد جدا) انجام
+    می‌شود تا فیچرها بین نمادها قاطی نشوند.
+    """
+    if df is None or df.empty:
+        logger.warning("compute_all_technical: ورودی خالی است")
+        return pd.DataFrame()
+    if "close" not in df.columns:
+        raise ValueError("ستون close برای محاسبه فیچرهای تکنیکال لازم است")
+
+    cfg = params or get_section("features", {}).get("technical_params", {}) or {}
+    sort_cols = [c for c in ("symbol", "gregorian_date", "date") if c in df.columns]
+    base = df.sort_values(sort_cols) if sort_cols else df.copy()
+
+    if "symbol" in base.columns:
+        parts = [_compute_one(g, cfg) for _, g in base.groupby("symbol", sort=False)]
+        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    else:
+        out = _compute_one(base, cfg).reset_index(drop=True)
+
+    if dropna:
+        out = out.dropna().reset_index(drop=True)
+    added = len(out.columns) - len(df.columns)
+    logger.info("فیچرهای تکنیکال ساخته شد ({} ستون جدید)", max(0, added))
+    return out
+
+
+def feature_columns(df: pd.DataFrame, exclude: Optional[Iterable[str]] = None) -> List[str]:
+    """لیست ستون‌های عددی قابل استفاده به‌عنوان فیچر مدل."""
+    skip = set(exclude or ()) | {
+        "id", "ins_code", "gregorian_date", "jalali_date", "symbol", "date",
+        "target", "target_class", "future_return",
+    }
+    return [c for c in df.columns if c not in skip and pd.api.types.is_numeric_dtype(df[c])]

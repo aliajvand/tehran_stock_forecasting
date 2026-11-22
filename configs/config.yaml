@@ -1,0 +1,102 @@
+project:
+  name: "Bourse Predictor"
+  version: "0.1.0"
+
+# بازارهایی که att.get_symbols از آن‌ها لیست می‌گیرد
+markets:
+  bourse: true
+  farabourse: false
+  payeh: false
+  haghe_taqadom: false
+  sandogh: false
+  bonds: false
+  options: false
+  mortgage: false
+  commodity: false
+  energy: false
+
+data:
+  ingestion_interval_sec: 10
+  history_years: 3
+  rate_limit_delay_sec: 0.2
+  batch_size: 50
+
+preprocessing:
+  outlier_method: "iqr"           # iqr | zscore
+  iqr_multiplier: 3.0
+  zscore_threshold: 5.0
+  max_gap_days: 5
+  drop_zero_volume_days: true
+
+features:
+  technical: true
+  order_book: true
+  money_flow: true
+  seasonal: true
+  news_sentiment: true
+  graph: true
+  sequence_length: 60
+  technical_params:
+    sma: [5, 10, 20, 50]
+    ema: [12, 26]
+    rsi: 14
+    macd: {fast: 12, slow: 26, signal: 9}
+    bollinger: {window: 20, std: 2.0}
+    atr: 14
+    stochastic: {k: 14, d: 3}
+  money_flow_windows: [1, 5, 20]
+  seasonal_period: 22             # ≈ یک ماه معاملاتی
+  graph:
+    window_days: 5
+    correlation_threshold: 0.3
+    same_sector_weight: 0.5
+
+model:
+  type: "hybrid_lstm_gnn"
+  lstm:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.3
+  gnn:
+    type: "GCN"
+    hidden_size: 64
+    num_layers: 2
+  ensemble:
+    members: ["hybrid", "xgboost"]
+    weights: [0.7, 0.3]
+  training:
+    batch_size: 64
+    epochs: 100
+    learning_rate: 0.001
+    early_stopping_patience: 10
+    walk_forward_splits: 5
+    seed: 42
+    device: "auto"                # auto | cpu | cuda
+
+backtesting:
+  initial_capital: 100000000
+  commission: 0.0037
+  slippage: 0.001
+  max_positions: 5
+
+news:
+  codal_base_url: "https://search.codal.ir"
+  sentiment_model: "HooshvareLab/bert-fa-base-uncased-sentiment-digikala"
+  max_pages: 3
+  request_delay_sec: 1.0
+
+api:
+  host: "127.0.0.1"
+  port: 8000
+
+logging:
+  level: "INFO"
+  file: "logs/app.log"
+
+paths:
+  db: "data/bourse.db"
+  raw: "data/raw"
+  processed: "data/processed"
+  features: "data/features"
+  models: "models/saved"
+  reports: "logs/evaluation"

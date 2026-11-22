@@ -1,0 +1,179 @@
+"""
+پاک‌سازی داده‌های خام بازار.
+
+توابع اصلی:
+    * ``clean_history``     : پاک‌سازی تاریخچه روزانه
+    * ``clean_client_type`` : پاک‌سازی و نرمال‌سازی داده حقیقی/حقوقی
+    * ``detect_outliers``   : شناسایی پرت‌ها با روش IQR یا Z-Score
+"""
+
+from __future__ import annotations
+
+from typing import Iterable, List, Optional
+
+import numpy as np
+import pandas as pd
+from loguru import logger
+
+from src.config import get_section
+
+PRICE_COLS: tuple[str, ...] = ("open", "high", "low", "close", "last")
+
+
+def detect_outliers(
+    df: pd.DataFrame,
+    columns: Optional[Iterable[str]] = None,
+    method: str = "iqr",
+    iqr_multiplier: float = 3.0,
+    zscore_threshold: float = 5.0,
+) -> pd.Series:
+    """
+    شناسایی سطرهای پرت.
+
+    پارامترها:
+        columns: ستون‌های عددی مورد بررسی (پیش‌فرض: ستون‌های قیمت).
+        method: ``iqr`` یا ``zscore``.
+
+    خروجی: سری بولی هم‌اندازه df که True یعنی پرت.
+    """
+    if df.empty:
+        return pd.Series(dtype=bool)
+
+    cols: List[str] = [c for c in (columns or PRICE_COLS) if c in df.columns]
+    mask = pd.Series(False, index=df.index)
+    for col in cols:
+        series = pd.to_numeric(df[col], errors="coerce")
+        if method == "zscore":
+            std = series.std(ddof=0)
+            if not std or np.isnan(std):
+                continue
+            flags = ((series - series.mean()).abs() / std) > zscore_threshold
+        else:  # iqr
+            q1, q3 = series.quantile(0.25), series.quantile(0.75)
+            iqr = q3 - q1
+            if not iqr or np.isnan(iqr):
+                continue
+            low, high = q1 - iqr_multiplier * iqr, q3 + iqr_multiplier * iqr
+            flags = (series < low) | (series > high)
+        mask |= flags.fillna(False)
+    return mask
+
+
+def adjust_prices(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    تعدیل قیمت‌ها بابت افزایش سرمایه/سود نقدی با روش ضریب بازگشتی.
+
+    اگر قیمت باز روز بعد نسبت به پایانی روز قبل جهش غیرعادی (بیش از ۲۰٪) داشته
+    باشد، ضریب تعدیل ساخته و به قیمت‌های قبلی اعمال می‌شود. اگر داده از
+    ``get_history(auto_adjust=True)`` آمده باشد، عملاً تغییری رخ نمی‌دهد.
+    """
+    if df.empty or "close" not in df.columns:
+        return df
+
+    out = df.copy()
+    close = pd.to_numeric(out["close"], errors="coerce")
+    open_ = pd.to_numeric(out.get("open", close), errors="coerce")
+    prev_close = close.shift(1)
+
+    ratio = (open_ / prev_close).replace([np.inf, -np.inf], np.nan)
+    jumps = ratio.where((ratio < 0.8) | (ratio > 1.2)).dropna()
+    if jumps.empty:
+        return out
+
+    factor = pd.Series(1.0, index=out.index)
+    for pos in jumps.index:
+        factor.loc[:pos] = factor.loc[:pos] * float(jumps.loc[pos])
+    for col in PRICE_COLS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce") * factor
+    logger.debug("{} نقطه تعدیل قیمت اعمال شد", len(jumps))
+    return out
+
+
+def clean_history(
+    df: pd.DataFrame,
+    adjust: bool = True,
+    drop_outliers: bool = True,
+) -> pd.DataFrame:
+    """
+    پاک‌سازی تاریخچه روزانه یک یا چند نماد.
+
+    مراحل: حذف تکراری‌ها → مرتب‌سازی → پر کردن NaN → حذف روزهای بی‌حجم →
+    تعدیل قیمت → حذف پرت‌ها.
+    """
+    if df is None or df.empty:
+        logger.warning("clean_history: ورودی خالی است")
+        return pd.DataFrame()
+
+    cfg = get_section("preprocessing", {})
+    out = df.copy()
+
+    key_cols = [c for c in ("symbol", "gregorian_date") if c in out.columns]
+    if key_cols:
+        out = out.drop_duplicates(subset=key_cols, keep="last").sort_values(key_cols)
+
+    numeric_cols = [c for c in PRICE_COLS + ("volume", "value", "trade_count") if c in out.columns]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    def _clean_group(group: pd.DataFrame) -> pd.DataFrame:
+        """پاک‌سازی یک نماد."""
+        g = group.copy()
+        max_gap = int(cfg.get("max_gap_days", 5))
+        g[numeric_cols] = g[numeric_cols].ffill(limit=max_gap)
+        g = g.dropna(subset=[c for c in ("close",) if c in g.columns])
+        if cfg.get("drop_zero_volume_days", True) and "volume" in g.columns:
+            g = g[g["volume"].fillna(0) > 0]
+        if adjust:
+            g = adjust_prices(g)
+        if drop_outliers and len(g) > 20:
+            mask = detect_outliers(
+                g,
+                method=str(cfg.get("outlier_method", "iqr")),
+                iqr_multiplier=float(cfg.get("iqr_multiplier", 3.0)),
+                zscore_threshold=float(cfg.get("zscore_threshold", 5.0)),
+            )
+            removed = int(mask.sum())
+            if removed:
+                logger.debug("{} سطر پرت حذف شد", removed)
+            g = g[~mask]
+        return g
+
+    if "symbol" in out.columns:
+        parts = [_clean_group(g) for _, g in out.groupby("symbol", sort=False)]
+        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    else:
+        out = _clean_group(out).reset_index(drop=True)
+
+    logger.info("clean_history: {} → {} سطر", len(df), len(out))
+    return out
+
+
+def clean_client_type(df: pd.DataFrame, normalize: bool = True) -> pd.DataFrame:
+    """
+    پاک‌سازی داده حقیقی/حقوقی.
+
+    مقادیر گمشده با ۰ پر می‌شوند و در صورت ``normalize=True`` ستون‌های نسبتی
+    (سهم خرید/فروش حقیقی از کل) اضافه می‌شود.
+    """
+    if df is None or df.empty:
+        logger.warning("clean_client_type: ورودی خالی است")
+        return pd.DataFrame()
+
+    out = df.copy()
+    key_cols = [c for c in ("symbol", "gregorian_date") if c in out.columns]
+    if key_cols:
+        out = out.drop_duplicates(subset=key_cols, keep="last").sort_values(key_cols)
+
+    numeric_cols = [c for c in out.columns if c.startswith(("n_", "vol_", "val_", "per_capita_", "power_"))]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    if normalize:
+        buy_total = out.get("vol_buy_retail", 0) + out.get("vol_buy_institutional", 0)
+        sell_total = out.get("vol_sell_retail", 0) + out.get("vol_sell_institutional", 0)
+        out["retail_buy_share"] = np.where(buy_total > 0, out.get("vol_buy_retail", 0) / buy_total, 0.0)
+        out["retail_sell_share"] = np.where(sell_total > 0, out.get("vol_sell_retail", 0) / sell_total, 0.0)
+
+    logger.info("clean_client_type: {} → {} سطر", len(df), len(out))
+    return out.reset_index(drop=True)
