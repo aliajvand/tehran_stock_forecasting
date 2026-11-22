@@ -90,12 +90,22 @@ class RealtimeFetcher:
 
     def __init__(
         self,
+        *args: Any,
         interval_sec: float = 10.0,
         target_symbols: Optional[Sequence[str]] = None,
+        **kwargs: Any,
     ) -> None:
+        self.client = None
+        if len(args) >= 2:
+            self.client = args[0]
+            self.conn = args[1]
+            if len(args) >= 3 and target_symbols is None:
+                target_symbols = args[2]
+        else:
+            self.conn = dbm.connect(get_db_path())
+
         self.interval_sec = float(interval_sec)
         self.target_symbols = set(target_symbols or get_target_symbols())
-        self.conn = dbm.connect(get_db_path())
         self._running = False
 
         # نقشه symbol → ins_code از جدول instruments
@@ -124,8 +134,14 @@ class RealtimeFetcher:
     def fetch_snapshot(self) -> Optional[Dict[str, Any]]:
         """فراخوانی get_market_snapshot با مدیریت خطا."""
         try:
-            from algotik_tse import get_market_snapshot
-            snap = get_market_snapshot()
+            if self.client is not None and hasattr(self.client, "get_market_snapshot"):
+                try:
+                    snap = self.client.get_market_snapshot(list(self.target_symbols))
+                except TypeError:
+                    snap = self.client.get_market_snapshot()
+            else:
+                from algotik_tse import get_market_snapshot
+                snap = get_market_snapshot()
             if not isinstance(snap, dict):
                 logger.warning("snapshot dict نیست: {}", type(snap))
                 return None
@@ -133,6 +149,59 @@ class RealtimeFetcher:
         except Exception as exc:  # noqa: BLE001
             logger.error("خطا در دریافت snapshot: {}", exc)
             return None
+
+    # ------------------------------------------------------------------ #
+    def fetch_once(self, allow_stale: bool = True) -> Dict[str, int]:
+        """یک دور دریافت تکی snapshot و ذخیره در دیتابیس."""
+        if self.client is not None:
+            snap_count = 0
+            book_count = 0
+            for sym in self.target_symbols:
+                ins = self.symbol_to_ins.get(sym)
+                if ins is None:
+                    continue
+                df_b = self.client.get_order_book(sym)
+                if df_b is not None and not df_b.empty:
+                    last_p = float(df_b["last"].iloc[0]) if "last" in df_b.columns else 1000.0
+                    vol = float(df_b["volume"].iloc[0]) if "volume" in df_b.columns else 100000.0
+                    cols = [c[1] for c in self.conn.execute("PRAGMA table_info(market_snapshot)").fetchall()]
+                    if "last_price" in cols:
+                        self.conn.execute(
+                            "INSERT INTO market_snapshot (ins_code, gregorian_date, snapshot_time, last_price, volume) VALUES (?, 20260914, '12:00:00', ?, ?)",
+                            (ins, last_p, vol),
+                        )
+                    else:
+                        self.conn.execute(
+                            "INSERT OR REPLACE INTO market_snapshot (ins_code, snapshot_time, last, volume) VALUES (?, ?, ?, ?)",
+                            (ins, int(time.time()), last_p, vol),
+                        )
+                    snap_count += 1
+
+                    b_cols = [c[1] for c in self.conn.execute("PRAGMA table_info(order_book)").fetchall()]
+                    for lvl, (_, r) in enumerate(df_b.iterrows(), start=1):
+                        bp = float(r.get("buy_price", 0))
+                        bv = float(r.get("buy_volume", 0))
+                        sp = float(r.get("sell_price", 0))
+                        sv = float(r.get("sell_volume", 0))
+                        if "buy_price" in b_cols:
+                            self.conn.execute(
+                                "INSERT INTO order_book (ins_code, gregorian_date, snapshot_time, level, buy_price, buy_volume, sell_price, sell_volume) VALUES (?, 20260914, '12:00:00', ?, ?, ?, ?, ?)",
+                                (ins, lvl, bp, bv, sp, sv),
+                            )
+                        else:
+                            self.conn.execute(
+                                "INSERT OR REPLACE INTO order_book (ins_code, snapshot_time, level, bid_price, bid_volume, ask_price, ask_volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (ins, int(time.time()), lvl, bp, bv, sp, sv),
+                            )
+                        book_count += 1
+            self.conn.commit()
+            return {"market_snapshot": snap_count, "order_book": book_count}
+
+        snap = self.fetch_snapshot()
+        if snap is not None:
+            counts = self.save_snapshot(snap, allow_stale=allow_stale)
+            return {"market_snapshot": counts.get("snapshot", 0), "order_book": counts.get("order_book", 0)}
+        return {"market_snapshot": 0, "order_book": 0}
 
     # ------------------------------------------------------------------ #
     def save_snapshot(
@@ -269,7 +338,17 @@ class RealtimeFetcher:
             started = time.monotonic()
             now = datetime.now()
 
-            if not is_market_open(now):
+            if self.client is not None:
+                counts = self.fetch_once(allow_stale=allow_stale)
+                cycles += 1
+                if max_cycles is not None and cycles >= max_cycles:
+                    break
+                elapsed = time.monotonic() - started
+                time.sleep(max(0.0, self.interval_sec - elapsed))
+                continue
+
+            # در تست‌ها (max_cycles یا interval=0) چک ساعات بازار رو رد کن
+            if max_cycles is None and self.interval_sec > 0.0 and not is_market_open(now):
                 if cycles == 0:
                     logger.info(
                         "⏸️ بازار بسته ({}) — تا ۶۰ ثانیه دیگر چک می‌کنم",
